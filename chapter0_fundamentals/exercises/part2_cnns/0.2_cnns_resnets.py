@@ -380,3 +380,63 @@ class Sequential(nn.Module):
 # %%
 # BatchNorm2d
 
+class BatchNorm2d(nn.Module):
+    # The type hints below aren't functional, they're just for documentation
+    running_mean: Float[Tensor, "num_features"]
+    running_var: Float[Tensor, "num_features"]
+    num_batches_tracked: Int[Tensor, ""]  # This is how we denote a scalar tensor
+
+    def __init__(self, num_features: int, eps=1e-05, momentum=0.1):
+        """
+        Like nn.BatchNorm2d with track_running_stats=True and affine=True.
+
+        Name the learnable affine parameters `weight` and `bias` in that order.
+        """
+        super().__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.momentum = momentum
+
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
+
+        self.register_buffer("running_mean", torch.zeros(num_features))
+        self.register_buffer("running_var", torch.ones(num_features))
+        self.register_buffer("num_batches_tracked", torch.tensor(0))
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Normalize each channel.
+
+        Compute the variance using `torch.var(x, correction=0)`
+        Hint: you may also find it helpful to use the argument `keepdim`.
+
+        x: shape (batch, channels, height, width)
+        Return: shape (batch, channels, height, width)
+        """
+        if self.training:
+            var = torch.var(x, dim=(0, 2, 3), correction=0, keepdim=True)
+            std = torch.sqrt(var + self.eps)
+            mean = torch.mean(x, dim=(0, 2, 3), keepdim=True)
+            x = (x - mean) / std
+
+            # Update running averages
+            self.num_batches_tracked += 1
+
+            self.running_mean.mul_(1 - self.momentum).add_(mean.squeeze() * self.momentum)
+            self.running_var.mul_(1 - self.momentum).add_(var.squeeze() * self.momentum)
+        
+        else:
+            mean = self.running_mean[:, None, None]
+            std = torch.sqrt(self.running_var[:, None, None] + self.eps)
+            x = (x - mean) / std
+        
+        return (self.weight[:, None, None] * x) + self.bias[:, None, None]
+
+    def extra_repr(self) -> str:
+        raise NotImplementedError()
+
+
+tests.test_batchnorm2d_module(BatchNorm2d)
+tests.test_batchnorm2d_forward(BatchNorm2d)
+tests.test_batchnorm2d_running_mean(BatchNorm2d)
