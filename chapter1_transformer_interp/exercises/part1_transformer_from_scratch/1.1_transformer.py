@@ -609,7 +609,22 @@ class TransformerSampler:
         Sampling terminates at max_tokens_generated, or when the model generates an end-of-sequence token. kwargs are
         passed to sample_next_token, to give detailed instructions on how new tokens are chosen.
         """
-        raise NotImplementedError()
+        # Put model in eval mode
+        self.model.eval()
+
+        # Tokenize prompt
+        seq = self.tokenizer.encode(prompt)
+        for _ in range(max_tokens_generated):
+            input_ids = torch.tensor(seq[-self.cfg.n_ctx:]).to(device)
+            logits = self.model.forward(input_ids[None, :])[0, -1]
+            next_token = self.sample_next_token(input_ids, logits, **kwargs)
+
+            # End-of-sequence token
+            if next_token == 50256:
+                break
+            seq.append(next_token)
+        
+        return self.tokenizer.decode(seq)
 
     @staticmethod
     def sample_next_token(
@@ -657,7 +672,7 @@ class TransformerSampler:
         """
         Applies temperature scaling to the logits.
         """
-        raise NotImplementedError()
+        return logits / temperature
 
     @staticmethod
     def apply_frequency_penalty(
@@ -666,28 +681,42 @@ class TransformerSampler:
         """
         Applies a frequency penalty to the logits.
         """
-        raise NotImplementedError()
+        d_vocab = logits.shape[0]
+        freqs = torch.bincount(input_ids, minlength=d_vocab)
+        return logits - freqs * freq_penalty
 
     @staticmethod
     def sample_basic(logits: Float[Tensor, "d_vocab"]) -> int:
         """
         Samples from the distribution defined by the logits.
         """
-        raise NotImplementedError()
+        return torch.distributions.categorical.Categorical(logits=logits).sample().item()
 
     @staticmethod
     def sample_top_k(logits: Float[Tensor, "d_vocab"], k: int) -> int:
         """
         Samples from the top k most likely tokens.
         """
-        raise NotImplementedError()
+        top_logits, top_indices = torch.topk(logits, k)
+        return top_indices[TransformerSampler.sample_basic(top_logits)]
 
     @staticmethod
     def sample_top_p(logits: Float[Tensor, "d_vocab"], top_p: float, min_tokens_to_keep: int = 1) -> int:
         """
         Samples from the most likely tokens which make up at least p cumulative probability.
         """
-        raise NotImplementedError()
+        # Copied from solutions
+        # Sort logits, and get cumulative probabilities
+        logits_sorted, indices = logits.sort(descending=True, stable=True)
+        cumul_probs = logits_sorted.softmax(-1).cumsum(-1)
+        # Choose which tokens to keep, in the set we sample from
+        n_keep = t.searchsorted(cumul_probs, top_p, side="left").item() + 1
+        n_keep = max(n_keep, min_tokens_to_keep)
+        keep_idx = indices[:n_keep]
+        keep_logits = logits[keep_idx]
+        # Perform the sampling
+        sample = t.distributions.categorical.Categorical(logits=keep_logits).sample()
+        return keep_idx[sample].item()
 
     @t.inference_mode()
     def beam_search(
@@ -705,6 +734,167 @@ class TransformerSampler:
         """
         raise NotImplementedError()
 
+
+# %% Define tokenizer
+
+tokenizer = reference_gpt2.tokenizer
+
+
+# %% sample_basic test
+
+prompt = "John and Mary went to the"
+input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+logits = model(input_ids)[0, -1]
+
+expected_top_5 = {" church": 0.0648, " house": 0.0367, " temple": 0.0145, " same": 0.0104, " Church": 0.0097}
+frequency_of_top_5 = defaultdict(int)
+
+N = 10_000
+for _ in tqdm(range(N)):
+    token = TransformerSampler.sample_next_token(input_ids.squeeze(), logits)
+    frequency_of_top_5[tokenizer.decode(token)] += 1
+
+for word in expected_top_5:
+    expected_freq = expected_top_5[word]
+    observed_freq = frequency_of_top_5[word] / N
+    print(f"Word: {word!r:<9}. Expected freq {expected_freq:.4f}, observed freq {observed_freq:.4f}")
+    assert abs(observed_freq - expected_freq) < 0.01, "Try increasing N if this fails by a small amount."
+
+print("Tests passed!")
+
+
+# %% temperature test
+
+logits = t.tensor([1, 2]).log()
+
+cold_logits = TransformerSampler.apply_temperature(logits, temperature=0.001)
+print('A low temperature "sharpens" or "peaks" the distribution: ', cold_logits)
+t.testing.assert_close(cold_logits, 1000.0 * logits)
+
+hot_logits = TransformerSampler.apply_temperature(logits, temperature=1000.0)
+print("A high temperature flattens the distribution: ", hot_logits)
+t.testing.assert_close(hot_logits, 0.001 * logits)
+
+print("Tests passed!")
+
+
+# %% frequency penalty
+
+bieber_prompt = "And I was like Baby, baby, baby, oh Like, Baby, baby, baby, no Like, Baby, baby, baby, oh I thought you'd always be mine, mine"
+input_ids = tokenizer.encode(bieber_prompt, return_tensors="pt")
+logits = t.ones(tokenizer.vocab_size)
+penalized_logits = TransformerSampler.apply_frequency_penalty(input_ids.squeeze(), logits, 2.0)
+
+assert penalized_logits[5156].item() == -11, "Expected 6 occurrences of ' baby' with leading space, 1-2*6=-11"
+assert penalized_logits[14801].item() == -5, "Expected 3 occurrences of ' Baby' with leading space, 1-2*3=-5"
+
+print("Tests passed!")
+
+
+# %% sampling -- manual testing
+
+sampler = TransformerSampler(model, tokenizer)
+
+N_RUNS = 1
+your_prompt = "Jingle bells, jingle bells, jingle all the way"
+cases = [
+    ("High freq penalty", dict(frequency_penalty=100.0)),
+    ("Negative freq penalty", dict(frequency_penalty=-3.0)),
+    ("Too hot!", dict(temperature=2.0)),
+    ("Pleasantly cool", dict(temperature=0.7)),
+    ("Pleasantly warm", dict(temperature=0.9)),
+    ("Too cold!", dict(temperature=0.01)),
+]
+
+table = Table("Name", "Kwargs", "Output", title="Sampling - Manual Testing")
+
+for name, kwargs in cases:
+    for i in range(N_RUNS):
+        output = sampler.sample(your_prompt, max_tokens_generated=24, **kwargs)
+        table.add_row(name, str(kwargs), repr(output) + "\n")
+
+rprint(table)
+
+
+# %% top-k sampling
+
+prompt = "John and Mary went to the"
+input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+logits = model(input_ids)[0, -1]
+
+expected_top_5 = {" church": 0.0648, " house": 0.0367, " temple": 0.0145, " same": 0.0104, " Church": 0.0097}
+topk_5_sum = sum(expected_top_5.values())
+
+observed_freqs = defaultdict(int)
+
+N = 10000
+for _ in tqdm(range(N)):
+    token = TransformerSampler.sample_next_token(input_ids.squeeze(), logits, top_k=5)
+    observed_freqs[tokenizer.decode(token)] += 1
+
+for word in expected_top_5:
+    expected_freq = expected_top_5[word] / topk_5_sum
+    observed_freq = observed_freqs[word] / N
+    print(f"Word: {word!r:<9}. Expected freq = {expected_freq:.4f}, observed freq = {observed_freq:.4f}")
+    assert abs(observed_freq - expected_freq) < 0.01
+
+# %% unicorns
+
+sampler = TransformerSampler(model, tokenizer)
+
+your_prompt = "In a shocking finding, scientist discovered a herd of unicorns living in a remote, previously unexplored valley, in the Andes Mountains. Even more surprising to the researchers was the fact that the unicorns spoke perfect English."
+  
+output = sampler.sample(your_prompt, temperature=0.7, top_k=40, max_tokens_generated=64)
+
+rprint(f"Your model said:\n\n[bold dark_orange]{output}")
+
+# %% top_p sampling
+
+prompt = "John and Mary went to the"
+input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+logits = model(input_ids)[0, -1]
+
+expected_top_10pct = {
+    " church": 0.0648,
+    " house": 0.0367,  # These are the two most likely tokens, and add up to >10%
+}
+top_10pct_sum = sum(expected_top_10pct.values())
+
+observed_freqs = defaultdict(int)
+
+N = 5000
+for _ in tqdm(range(N)):
+    token = TransformerSampler.sample_next_token(input_ids.squeeze(), logits, top_p=0.1)
+    observed_freqs[tokenizer.decode(token)] += 1
+
+for word in expected_top_10pct:
+    expected_freq = expected_top_10pct[word] / top_10pct_sum
+    observed_freq = observed_freqs[word] / N
+    print(f"Word: {word!r:<9}. Expected freq {expected_freq:.4f}, observed freq {observed_freq:.4f}")
+    assert abs(observed_freq - expected_freq) < 0.01, "Try increasing N if this fails by a small amount."
+
+
+# %% beam search
+# not gonna implement this b/c it's too difficult
+
+# Start with prompt "When I was", get top 3 tokens (and their logprobs), and use that to create & display the top 3 beams
+prompt = "When I was"
+tokens = tokenizer.encode(prompt, return_tensors="pt").to(device)
+logprobs = model(tokens)[0, -1].log_softmax(-1)
+top_logprobs, top_tokens = logprobs.topk(k=3, dim=-1)
+
+new_tokens = t.concat([tokens.repeat(3, 1), top_tokens.unsqueeze(-1)], dim=-1)
+
+beams = solutions.Beams(model, tokenizer, logprob_sums=top_logprobs, tokens=new_tokens)
+beams.print()
+
+
+
+
+
+
+
+# %% Actual test
 
 t.set_grad_enabled(False)  # gradients are not necessary for sampling
 
